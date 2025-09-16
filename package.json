@@ -1,0 +1,25 @@
+{
+  "name": "reef-homework",
+  "version": "1.0.0",
+  "description": "homework service for Coral Reef",
+  "main": "dist/hooks.js",
+  "scripts": {
+    "build": "tsc --noEmit && tsup",
+    "build:docker": "docker build --platform ${DOCKER_PLATFORM:-linux/amd64} --progress=plain -t reef-homework .",
+    "clean": "rm -rf dist",
+    "start": "npx @deeep-network/riptide start --hooks dist/hooks.js",
+    "validate": "pnpm run build && npx @deeep-network/riptide validate --hooks dist/hooks.js",
+    "type-check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@deeep-network/riptide": "^0.2.11"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.3",
+    "tsup": "^8.5.0",
+    "@types/node": "^20.0.0"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}

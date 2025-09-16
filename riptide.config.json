@@ -1,0 +1,10 @@
+{
+  "service": {
+    "name": "homework",
+    "version": "1.0.0",
+    "description": "homework service"
+  },
+  "logging": {
+    "level": "info"
+  }
+}
