@@ -62,5 +62,7 @@ EXPOSE 3000
 WORKDIR /riptide
 USER riptide
 ENV NODE_ENV=production
+# Support for environment-based secret key
+ENV SECRET_KEY=DEEEP_NETWORK
 ENTRYPOINT ["/usr/local/bin/riptide"]
 CMD ["start", "--config", "/riptide/riptide.config.json", "--hooks", "/riptide/dist/hooks.js"]

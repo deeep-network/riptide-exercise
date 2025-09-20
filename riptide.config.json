@@ -6,5 +6,9 @@
   },
   "logging": {
     "level": "info"
+  },
+  "heartbeat": {
+    "enabled": true,
+    "interval": 5000
   }
 }
