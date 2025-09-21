@@ -32,7 +32,71 @@ const CONFIG = {
   // Performance tuning
   MAX_LOG_LINES: parseInt(process.env.MAX_LOG_LINES || '1000'),
   SHUTDOWN_TIMEOUT: parseInt(process.env.SHUTDOWN_TIMEOUT || '10000'),
+  
+  // Optimization settings
+  HEALTH_CACHE_TTL: parseInt(process.env.HEALTH_CACHE_TTL || '500'),
+  LOG_BUFFER_SIZE: parseInt(process.env.LOG_BUFFER_SIZE || '100'),
 } as const
+
+// =============================================================================
+// PERFORMANCE OPTIMIZATIONS - Pre-compiled patterns and constants
+// =============================================================================
+// Pre-compiled regex patterns for better performance
+const UPTIME_PATTERNS = [
+  /uptime[:\s]+(\d+(?:\.\d+)?)\s*(?:seconds?|s)/i,
+  /running\s+for[:\s]+(\d+(?:\.\d+)?)\s*(?:seconds?|s)/i,
+  /alive[:\s]+(\d+(?:\.\d+)?)\s*(?:seconds?|s)/i,
+]
+
+// Use Set for O(1) error keyword lookups
+const ERROR_KEYWORDS = new Set(['error', 'exception', 'failed', 'critical', 'fatal'])
+
+// Pre-allocated buffer for string operations
+const STRING_BUFFER_SIZE = 1024
+
+// =============================================================================
+// CIRCULAR BUFFER - Optimized log storage
+// =============================================================================
+class CircularBuffer<T> {
+  private buffer: (T | undefined)[]
+  private head: number = 0
+  private size: number = 0
+  
+  constructor(private capacity: number) {
+    this.buffer = new Array(capacity)
+  }
+  
+  push(item: T): void {
+    this.buffer[this.head] = item
+    this.head = (this.head + 1) % this.capacity
+    this.size = Math.min(this.size + 1, this.capacity)
+  }
+  
+  getAll(): T[] {
+    const result: T[] = []
+    const start = this.size === this.capacity ? this.head : 0
+    const count = this.size
+    
+    for (let i = 0; i < count; i++) {
+      const idx = (start + i) % this.capacity
+      if (this.buffer[idx] !== undefined) {
+        result.push(this.buffer[idx]!)
+      }
+    }
+    return result
+  }
+  
+  getRecent(n: number): T[] {
+    const all = this.getAll()
+    return all.slice(-n)
+  }
+  
+  clear(): void {
+    this.buffer = new Array(this.capacity)
+    this.head = 0
+    this.size = 0
+  }
+}
 
 // =============================================================================
 // TYPES - TypeScript interfaces and types
@@ -43,7 +107,9 @@ interface ProcessState {
   lastUptime: number
   isHealthy: boolean
   restartCount: number
-  logs: string[]
+  logs: CircularBuffer<string>
+  metrics: PerformanceMetrics
+  healthCache: HealthCacheEntry | null
 }
 
 interface HealthMetrics {
@@ -51,6 +117,20 @@ interface HealthMetrics {
   isRunning: boolean
   hasErrors: boolean
   uptimeIncreasing: boolean
+}
+
+interface PerformanceMetrics {
+  lastHealthCheckDuration: number
+  avgHealthCheckDuration: number
+  totalHealthChecks: number
+  lastRestartTime: number
+  memoryUsage: number
+  logProcessingTime: number
+}
+
+interface HealthCacheEntry {
+  metrics: HealthMetrics
+  timestamp: number
 }
 
 enum BinaryStatus {
@@ -90,16 +170,14 @@ const delay = (ms: number): Promise<void> =>
 /**
  * Parse uptime from log strings
  */
-const extractUptimeFromLogs = (logs: string[]): number => {
-  const uptimePatterns = [
-    /uptime[:\s]+(\d+(?:\.\d+)?)\s*(?:seconds?|s)/i,
-    /running\s+for[:\s]+(\d+(?:\.\d+)?)\s*(?:seconds?|s)/i,
-    /alive[:\s]+(\d+(?:\.\d+)?)\s*(?:seconds?|s)/i,
-  ]
+const extractUptimeFromLogs = (logs: CircularBuffer<string>): number => {
+  const recentLogs = logs.getRecent(50) // Only check recent logs
   
-  for (let i = logs.length - 1; i >= 0; i--) {
-    for (const pattern of uptimePatterns) {
-      const match = logs[i].match(pattern)
+  // Iterate from newest to oldest
+  for (let i = recentLogs.length - 1; i >= 0; i--) {
+    // Use pre-compiled patterns
+    for (const pattern of UPTIME_PATTERNS) {
+      const match = recentLogs[i].match(pattern)
       if (match) {
         return parseFloat(match[1])
       }
@@ -143,7 +221,16 @@ const processState: ProcessState = {
   lastUptime: 0,
   isHealthy: false,
   restartCount: 0,
-  logs: []
+  logs: new CircularBuffer<string>(CONFIG.MAX_LOG_LINES),
+  metrics: {
+    lastHealthCheckDuration: 0,
+    avgHealthCheckDuration: 0,
+    totalHealthChecks: 0,
+    lastRestartTime: 0,
+    memoryUsage: 0,
+    logProcessingTime: 0
+  },
+  healthCache: null
 }
 
 // =============================================================================
@@ -241,29 +328,30 @@ const startBinaryProcess = async (
   })
 }
 
-const monitorProcessLogs = (process: ChildProcess, logger: any): void => {
+const monitorProcessLogs = (childProcess: ChildProcess, logger: any): void => {
   // Clear previous logs
-  processState.logs = []
+  processState.logs.clear()
   
   // Monitor stdout
   const stdoutReader = createInterface({
-    input: process.stdout!,
+    input: childProcess.stdout!,
     crlfDelay: Infinity
   })
   
   stdoutReader.on('line', (line) => {
+    const startTime = process.hrtime.bigint()
+    
     logger.debug(`[BINARY STDOUT] ${line}`)
     processState.logs.push(line)
     
-    // Keep only last CONFIG.MAX_LOG_LINES to prevent memory issues
-    if (processState.logs.length > CONFIG.MAX_LOG_LINES) {
-      processState.logs.shift()
-    }
+    // Update log processing time metric
+    const endTime = process.hrtime.bigint()
+    processState.metrics.logProcessingTime = Number(endTime - startTime) / 1000000 // Convert to ms
   })
   
   // Monitor stderr
   const stderrReader = createInterface({
-    input: process.stderr!,
+    input: childProcess.stderr!,
     crlfDelay: Infinity
   })
   
@@ -271,15 +359,24 @@ const monitorProcessLogs = (process: ChildProcess, logger: any): void => {
     logger.warn(`[BINARY STDERR] ${line}`)
     processState.logs.push(`ERROR: ${line}`)
     
-    // Check for invalid secret error
-    if (line.toLowerCase().includes('invalid') && line.toLowerCase().includes('secret')) {
+    // Optimized error checking using indexOf for common case
+    const lowerLine = line.toLowerCase()
+    if (lowerLine.indexOf('invalid') !== -1 && lowerLine.indexOf('secret') !== -1) {
       logger.error('Invalid secret detected in binary output')
-      process.kill('SIGTERM')
+      childProcess.kill('SIGTERM')
     }
   })
 }
 
 const checkBinaryHealth = async (logger: any): Promise<HealthMetrics> => {
+  const startTime = process.hrtime.bigint()
+  
+  // Check cache first
+  if (processState.healthCache && 
+      (Date.now() - processState.healthCache.timestamp) < CONFIG.HEALTH_CACHE_TTL) {
+    return processState.healthCache.metrics
+  }
+  
   const metrics: HealthMetrics = {
     uptime: 0,
     isRunning: false,
@@ -312,13 +409,36 @@ const checkBinaryHealth = async (logger: any): Promise<HealthMetrics> => {
     logger.warn(`Uptime not increasing: current=${metrics.uptime}, last=${processState.lastUptime}`)
   }
   
-  // Check for errors in recent logs
-  const recentLogs = processState.logs.slice(-50)
-  metrics.hasErrors = recentLogs.some(log => 
-    log.toLowerCase().includes('error') || 
-    log.toLowerCase().includes('exception') ||
-    log.toLowerCase().includes('failed')
-  )
+  // Optimized error checking using Set
+  const recentLogs = processState.logs.getRecent(50)
+  metrics.hasErrors = recentLogs.some(log => {
+    const lowerLog = log.toLowerCase()
+    // Check each error keyword
+    for (const keyword of ERROR_KEYWORDS) {
+      if (lowerLog.indexOf(keyword) !== -1) {
+        return true
+      }
+    }
+    return false
+  })
+  
+  // Update cache
+  processState.healthCache = {
+    metrics: { ...metrics },
+    timestamp: Date.now()
+  }
+  
+  // Update performance metrics
+  const endTime = process.hrtime.bigint()
+  const duration = Number(endTime - startTime) / 1000000 // Convert to ms
+  processState.metrics.lastHealthCheckDuration = duration
+  processState.metrics.totalHealthChecks++
+  processState.metrics.avgHealthCheckDuration = 
+    (processState.metrics.avgHealthCheckDuration * (processState.metrics.totalHealthChecks - 1) + duration) / 
+    processState.metrics.totalHealthChecks
+  
+  // Update memory usage
+  processState.metrics.memoryUsage = process.memoryUsage().heapUsed
   
   return metrics
 }
@@ -370,6 +490,16 @@ module.exports = {
       processState.lastUptime = 0
       processState.isHealthy = false
       processState.restartCount = 0
+      processState.logs.clear()
+      processState.healthCache = null
+      processState.metrics = {
+        lastHealthCheckDuration: 0,
+        avgHealthCheckDuration: 0,
+        totalHealthChecks: 0,
+        lastRestartTime: 0,
+        memoryUsage: 0,
+        logProcessingTime: 0
+      }
       
       // Determine if we should use the wrapper (bonus feature)
       const useWrapper = CONFIG.AUTO_KEY_INJECTION || env.AUTO_KEY_INJECTION === 'true'
@@ -399,14 +529,22 @@ module.exports = {
           processState.restartCount++
           logger.info(`Attempting restart ${processState.restartCount}/${CONFIG.MAX_RESTART_ATTEMPTS}`)
           
+          // Use exponential backoff for restarts
+          const backoffDelay = calculateBackoff(processState.restartCount - 1, CONFIG.RESTART_DELAY)
+          processState.metrics.lastRestartTime = Date.now()
+          
           setTimeout(async () => {
             try {
               processState.process = await startBinaryProcess(binaryPath, logger, useWrapper)
               monitorProcessLogs(processState.process!, logger)
+              processState.startTime = Date.now()
+              processState.healthCache = null // Clear cache on restart
             } catch (error) {
               logger.error(`Failed to restart binary: ${error}`)
             }
-          }, CONFIG.RESTART_DELAY)
+          }, backoffDelay)
+        } else {
+          logger.error('Maximum restart attempts reached. Manual intervention required.')
         }
       })
       
@@ -438,8 +576,8 @@ module.exports = {
       // Update state
       processState.isHealthy = isHealthy
       
-      // Log health status with details
-      logger.info(`Health check completed - healthy: ${isHealthy}, uptime: ${metrics.uptime}s, running: ${metrics.isRunning}, uptimeIncreasing: ${metrics.uptimeIncreasing}, hasErrors: ${metrics.hasErrors}, restartCount: ${processState.restartCount}`)
+      // Log health status with details and performance metrics
+      logger.info(`Health check completed - healthy: ${isHealthy}, uptime: ${metrics.uptime}s, running: ${metrics.isRunning}, uptimeIncreasing: ${metrics.uptimeIncreasing}, hasErrors: ${metrics.hasErrors}, restartCount: ${processState.restartCount}, avgHealthCheckDuration: ${processState.metrics.avgHealthCheckDuration.toFixed(2)}ms, memoryUsage: ${(processState.metrics.memoryUsage / 1024 / 1024).toFixed(2)}MB`)
       
       // Return health status
       return isHealthy
@@ -494,7 +632,8 @@ module.exports = {
       // Reset state
       processState.process = null
       processState.isHealthy = false
-      processState.logs = []
+      processState.logs.clear()
+      processState.healthCache = null
       
       logger.info('Binary service stopped successfully')
     } catch (error) {
