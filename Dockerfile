@@ -8,13 +8,15 @@ RUN apk add --no-cache libc6-compat
 WORKDIR /app
 COPY package.json package-lock.json ./
 
+# Install dependencies
+RUN npm ci
+
 # Copy source code and config
 COPY tsconfig.json ./
 COPY tsup.config.ts ./
 COPY src ./src
 
 # Build the application
-RUN npm install
 RUN npm run build
 RUN npm prune --omit=dev
 
@@ -29,19 +31,26 @@ RUN apk add --no-cache \
     bash \
     procps \
     ca-certificates \
-    libc6-compat
-
+    libc6-compat \
+    # For process monitoring
+    htop \
+    # For debugging
+    strace
 
 WORKDIR /app
 
-# Add any homework-specific setup here
-# Example: Download binaries, create users, set up directories
-#  COPY THE BINARY HERE
+# Add homework-specific setup
+# Copy the binary and set proper permissions
 COPY binary /app/binary
-# PERMISSION TO BINARY - Allow binary to create/modify files in /app
-RUN chmod +x /app/binary && chmod 777 /app
-# Make sure riptide user can access /app directory
-RUN chown -R 1005:1005 /app
+
+# Set secure permissions (executable but not writable by others)
+RUN chmod 755 /app/binary && \
+    # Create necessary directories
+    mkdir -p /app/logs /app/tmp && \
+    # Set ownership for riptide user
+    chown -R 1005:1005 /app && \
+    # Ensure binary is executable
+    chmod +x /app/binary
 
 # ----------------------------------------
 # Riptide Runtime Layer
@@ -62,5 +71,11 @@ EXPOSE 3000
 WORKDIR /riptide
 USER riptide
 ENV NODE_ENV=production
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+  CMD /usr/local/bin/riptide health || exit 1
+
+# Entry point
 ENTRYPOINT ["/usr/local/bin/riptide"]
 CMD ["start", "--config", "/riptide/riptide.config.json", "--hooks", "/riptide/dist/hooks.js"]
